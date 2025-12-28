@@ -26,10 +26,13 @@ use composefs::{
 #[derive(Debug, Parser)]
 #[clap(name = "cfsctl", version)]
 pub struct App {
+    /// Operate on repo at path
     #[clap(long, group = "repopath")]
     repo: Option<PathBuf>,
+    /// Operate on repo at standard user location $HOME/.var/lib/composefs
     #[clap(long, group = "repopath")]
     user: bool,
+    /// Operate repo at standard system location /sysroot/composefs
     #[clap(long, group = "repopath")]
     system: bool,
 
@@ -50,53 +53,85 @@ pub struct App {
 #[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
-    /// Stores a tar file as a splitstream in the repository.
+    /// Stores a tar layer file as a splitstream in the repository.
     ImportLayer {
         sha256: String,
         name: Option<String>,
     },
     /// Lists the contents of a tar stream
     LsLayer {
-        /// the name of the stream
+        /// the name of the stream to list, either an sha256 stream ID or prefixed with 'ref/'
         name: String,
     },
+    /// Dump full content of the rootfs of a stored OCI image to a composefs dumpfile and write to stdout
     Dump {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         config_name: String,
+        /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
     },
+    /// Pull an OCI image to be stored in repo then prints the stream and verity digest of its manifest
     Pull {
+        /// source image reference, as accepted by skopeo
         image: String,
+        /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
         name: Option<String>,
     },
+    /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         config_name: String,
+        /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
+        /// wether bootable preparation should be performed on the image before computation 
         #[clap(long)]
         bootable: bool,
     },
+    /// Create the composefs image of the rootfs of a stored OCI image, commit it to the repo, and print its image object ID
     CreateImage {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         config_name: String,
+        /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
+        /// wether bootable preparation should be performed on the image before committing
         #[clap(long)]
         bootable: bool,
+        /// optional reference name for the image, use as 'ref/<name>' elsewhere
         #[clap(long)]
         image_name: Option<String>,
     },
+    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
+    /// in the repo, then prints the stream and verity digest of the new sealed manifest
     Seal {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         config_name: String,
+        /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
     },
+    /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
+    /// and committed to the repo first
     Mount {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         name: String,
+        /// the mountpoint
         mountpoint: String,
     },
+    /// Create the composefs image of the rootfs of a stored OCI image, perform bootable preparation, commit it to the repo,
+    /// then configure boot for the image by writing new boot resources and bootloader entires to boot partition. Performs 
+    /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
+    /// consumption by bootc.
     PrepareBoot {
+        /// the name of the stream that points to the OCI image manifest, either an sha256 stream ID or prefixed with 'ref/'
         config_name: String,
+        /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
+        /// boot partition mount point
         #[clap(long, default_value = "/boot")]
         bootdir: PathBuf,
+        /// boot entry identifier to use. by default use id provided by the image or kernel version
         #[clap(long)]
         entry_id: Option<String>,
+        /// additional kernel command line
         #[clap(long)]
         cmdline: Vec<String>,
     },
@@ -109,7 +144,7 @@ enum Command {
     Transaction,
     /// Reconstitutes a split stream and writes it to stdout
     Cat {
-        /// the name of the stream to cat, either a sha512 digest or prefixed with 'ref/'
+        /// the name of the stream to cat, either an sha256 stream ID or prefixed with 'ref/'
         name: String,
     },
     /// Perform garbage collection
@@ -118,42 +153,60 @@ enum Command {
     ImportImage {
         reference: String,
     },
-    /// Commands for dealing with OCI layers
+    /// Commands for dealing with OCI images and layers
     #[cfg(feature = "oci")]
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
     },
-    /// Mounts a composefs, possibly enforcing fsverity of the image
+    /// Mounts a composefs image, possibly enforcing fsverity of the image
     Mount {
-        /// the name of the image to mount, either a sha512 digest or prefixed with 'ref/'
+        /// the name of the image to mount, either an object ID digest or prefixed with 'ref/'
         name: String,
         /// the mountpoint
         mountpoint: String,
     },
+    /// Read rootfs located at a path, add all files to the repo, then create the composefs image of the rootfs,
+    /// commit it to the repo, and print its image object ID
     CreateImage {
+        /// the path to read rootfs from
         path: PathBuf,
+        /// wether bootable preparation should be performed on the image before committing
         #[clap(long)]
         bootable: bool,
+        /// also store rootfs directory's own metadata in the image
         #[clap(long)]
         stat_root: bool,
+        /// optional reference name for the image, use as 'ref/<name>' elsewhere
         image_name: Option<String>,
     },
+    /// Read rootfs located at a path, add all files to the repo, then compute the composefs image object id of the rootfs.
+    /// Note that this does not create or commit the compose image itself.
     ComputeId {
+        /// the path to read rootfs from
         path: PathBuf,
+        /// wether bootable preparation should be performed on the image before computation
         #[clap(long)]
         bootable: bool,
+        /// also include rootfs directory's own metadata for the computation
         #[clap(long)]
         stat_root: bool,
     },
+    /// Read rootfs located at a path, add all files to the repo, then dump full content of the rootfs to a composefs dumpfile
+    /// and write to stdout.
     CreateDumpfile {
+        /// the path to read rootfs from
         path: PathBuf,
+        /// wether bootable preparation should be performed on the image before the dump
         #[clap(long)]
         bootable: bool,
+        /// also include rootfs directory's own metadata in the dump
         #[clap(long)]
         stat_root: bool,
     },
+    /// Open a composefs image and print all object files it refers to
     ImageObjects {
+        /// the name of the image to read, either an object ID digest or prefixed with 'ref/'
         name: String,
     },
     #[cfg(feature = "http")]
