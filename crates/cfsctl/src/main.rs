@@ -26,10 +26,13 @@ use composefs::{
 #[derive(Debug, Parser)]
 #[clap(name = "cfsctl", version)]
 pub struct App {
+    /// Operate on repo at path
     #[clap(long, group = "repopath")]
     repo: Option<PathBuf>,
+    /// Operate on repo at standard user location $HOME/.var/lib/composefs
     #[clap(long, group = "repopath")]
     user: bool,
+    /// Operate repo at standard system location /sysroot/composefs
     #[clap(long, group = "repopath")]
     system: bool,
 
@@ -54,58 +57,86 @@ enum HashType {
     Sha512,
 }
 
+/// Common options for working with OCI config manifest streams
+#[derive(Debug, Parser)]
+struct OCIConfigOptions {
+    /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
+    config_name: String,
+    /// verity digest for the manifest stream to be verified against
+    config_verity: Option<String>,
+    /// wether bootable preparation should be performed on the image before any operation
+    #[clap(long)]
+    bootable: bool,
+}
+
 #[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
-    /// Stores a tar file as a splitstream in the repository.
+    /// Stores a tar layer file as a splitstream in the repository.
     ImportLayer {
         digest: String,
         name: Option<String>,
     },
     /// Lists the contents of a tar stream
     LsLayer {
-        /// the name of the stream
+        /// the name of the stream to list, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
         name: String,
     },
+    /// Dump full content of the rootfs of a stored OCI image to a composefs dumpfile and write to stdout
     Dump {
-        config_name: String,
-        config_verity: Option<String>,
-        #[clap(long)]
-        bootable: bool,
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
     },
+    /// Pull an OCI image to be stored in repo then prints the stream and verity digest of its manifest
     Pull {
+        /// source image reference, as accepted by skopeo
         image: String,
+        /// optional reference name for the manifest, use as 'ref/<name>' elsewhere
         name: Option<String>,
     },
+    /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
-        config_name: String,
-        config_verity: Option<String>,
-        #[clap(long)]
-        bootable: bool,
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
     },
+    /// Create the composefs image of the rootfs of a stored OCI image, commit it to the repo, and print its image object ID
     CreateImage {
-        config_name: String,
-        config_verity: Option<String>,
-        #[clap(long)]
-        bootable: bool,
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
+        /// optional reference name for the image, use as 'ref/<name>' elsewhere
         #[clap(long)]
         image_name: Option<String>,
     },
+    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
+    /// in the repo, then prints the stream and verity digest of the new sealed manifest
+    /// --bootable flag is always ignored for this operation.
     Seal {
-        config_name: String,
-        config_verity: Option<String>,
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
     },
+    /// Mounts a stored and sealed OCI image by looking up its composefs image. Note that the composefs image must be built
+    /// and committed to the repo first
     Mount {
+        /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
         name: String,
+        /// the mountpoint
         mountpoint: String,
     },
+    /// Create the composefs image of the rootfs of a stored OCI image, perform bootable preparation, commit it to the repo,
+    /// then configure boot for the image by writing new boot resources and bootloader entires to boot partition. Performs
+    /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
+    /// consumption by bootc.
+    /// --bootable flag is always considered set for this operation.
     PrepareBoot {
-        config_name: String,
-        config_verity: Option<String>,
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
+        /// boot partition mount point
         #[clap(long, default_value = "/boot")]
         bootdir: PathBuf,
+        /// boot entry identifier to use. by default use id provided by the image or kernel version
         #[clap(long)]
         entry_id: Option<String>,
+        /// additional kernel command line
         #[clap(long)]
         cmdline: Vec<String>,
     },
@@ -145,37 +176,44 @@ enum Command {
     },
     /// Imports a composefs image (unsafe!)
     ImportImage { reference: String },
-    /// Commands for dealing with OCI layers
+    /// Commands for dealing with OCI images and layers
     #[cfg(feature = "oci")]
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
     },
-    /// Mounts a composefs, possibly enforcing fsverity of the image
+    /// Mounts a composefs image, possibly enforcing fsverity of the image
     Mount {
         /// the name of the image to mount, either an fs-verity hash or prefixed with 'ref/'
         name: String,
         /// the mountpoint
         mountpoint: String,
     },
-    /// Creates a composefs image from a filesystem
+    /// Read rootfs located at a path, add all files to the repo, then create the composefs image of the rootfs,
+    /// commit it to the repo, and print its image object ID
     CreateImage {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
+        /// optional reference name for the image, use as 'ref/<name>' elsewhere
         image_name: Option<String>,
     },
-    /// Computes the composefs image ID for a filesystem
+    /// Read rootfs located at a path, add all files to the repo, then compute the composefs image object id of the rootfs.
+    /// Note that this does not create or commit the compose image itself.
     ComputeId {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
-    /// Outputs the composefs dumpfile format for a filesystem
+    /// Read rootfs located at a path, add all files to the repo, then dump full content of the rootfs to a composefs dumpfile
+    /// and write to stdout.
     CreateDumpfile {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
     /// Lists all object IDs referenced by an image
-    ImageObjects { name: String },
+    ImageObjects {
+        /// the name of the image to read, either an object ID digest or prefixed with 'ref/'
+        name: String,
+    },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
 }
@@ -256,9 +294,12 @@ where
                 composefs_oci::ls_layer(&repo, &name)?;
             }
             OciCommand::Dump {
-                ref config_name,
-                ref config_verity,
-                bootable,
+                config_opts:
+                    OCIConfigOptions {
+                        ref config_name,
+                        ref config_verity,
+                        bootable,
+                    },
             } => {
                 let verity = verity_opt(config_verity)?;
                 let mut fs =
@@ -269,9 +310,12 @@ where
                 fs.print_dumpfile()?;
             }
             OciCommand::ComputeId {
-                ref config_name,
-                ref config_verity,
-                bootable,
+                config_opts:
+                    OCIConfigOptions {
+                        ref config_name,
+                        ref config_verity,
+                        bootable,
+                    },
             } => {
                 let verity = verity_opt(config_verity)?;
                 let mut fs =
@@ -283,9 +327,12 @@ where
                 println!("{}", id.to_hex());
             }
             OciCommand::CreateImage {
-                ref config_name,
-                ref config_verity,
-                bootable,
+                config_opts:
+                    OCIConfigOptions {
+                        ref config_name,
+                        ref config_verity,
+                        bootable,
+                    },
                 ref image_name,
             } => {
                 let verity = verity_opt(config_verity)?;
@@ -305,8 +352,12 @@ where
                 println!("verity {}", verity.to_hex());
             }
             OciCommand::Seal {
-                ref config_name,
-                ref config_verity,
+                config_opts:
+                    OCIConfigOptions {
+                        ref config_name,
+                        ref config_verity,
+                        ..
+                    },
             } => {
                 let verity = verity_opt(config_verity)?;
                 let (digest, verity) =
@@ -321,8 +372,12 @@ where
                 composefs_oci::mount(&repo, name, mountpoint, None)?;
             }
             OciCommand::PrepareBoot {
-                ref config_name,
-                ref config_verity,
+                config_opts:
+                    OCIConfigOptions {
+                        ref config_name,
+                        ref config_verity,
+                        ..
+                    },
                 ref bootdir,
                 ref entry_id,
                 ref cmdline,
