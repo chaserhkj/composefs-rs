@@ -19,8 +19,8 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, AtFlags, Dir, FileType,
-        FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, unlinkat, AtFlags, Dir,
+        FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -616,21 +616,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
     }
 
-    // For a GC category (images / streams), return underlying entry digests and
-    // object IDs for each entry, as a reverse lookup map
+    // Returns Ok(None) if the category does not exist
+    fn open_gc_category(&self, category: &str) -> Result<Option<OwnedFd>> {
+        self.openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .filter_errno(Errno::NOENT)
+            .context("Opening {category} dir in repository")
+    }
+
+    // For a GC category folder fd, return underlying entry digests as GC Roots
     // If refs_only == false, all entries will be returned, and only orphans in
     // objects/ will be GC'd
     // If refs_only == true, only entries explicitly referred to in <category>/refs
     // will be returned, allow unlinked entries to be GC'ed
-    fn gc_category(&self, category: &str, refs_only: bool) -> Result<HashMap<ObjectID, String>> {
-        let Some(category_fd) = self
-            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
-            .filter_errno(Errno::NOENT)
-            .context("Opening {category} dir in repository")?
-        else {
-            return Ok(HashMap::new());
-        };
-
+    fn gc_category_roots(
+        &self,
+        category_fd: &OwnedFd,
+        refs_only: bool,
+    ) -> Result<HashSet<CString>> {
         let mut entry_digests = HashSet::new();
         if refs_only {
             if let Some(refs) = openat(
@@ -657,7 +659,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 }
             }
         }
+        Ok(entry_digests)
+    }
 
+    // For a GC category folder fd and a list of entry digests in it, resolve their object
+    // references and return a reverse lookup map of linked object ids to entry digests
+    fn gc_category_entry_ids<I>(
+        &self,
+        category_fd: &OwnedFd,
+        entry_digests: I,
+    ) -> Result<HashMap<ObjectID, String>>
+    where
+        I: IntoIterator<Item = CString>,
+    {
         let objects = entry_digests
             .into_iter()
             .map(|entry_fn| {
@@ -721,26 +735,62 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
-    pub fn gc(&self) -> Result<()> {
+    pub fn gc(
+        &self,
+        root_images: Vec<String>,
+        root_streams: Vec<String>,
+        orphans_only: bool,
+        force: bool,
+    ) -> Result<()> {
         flock(&self.repository, FlockOperation::LockExclusive)?;
 
         let mut objects = HashSet::new();
 
-        for ref image in self.gc_category("images", true)? {
-            println!("# {image:?} lives as an image");
-            objects.insert(image.0.clone());
-            self.objects_for_image(&image.1)?.iter().for_each(|id| {
-                println!("#   with {id:?}");
-                objects.insert(id.clone());
-            });
+        // Find live objects from images
+        if let Some(images_fd) = self.open_gc_category("images")? {
+            // Use explicitly specified root images
+            let mut root_image_digests = root_images
+                .into_iter()
+                .map(|digest| {
+                    CString::new(digest).context("Converting input root_images to CString")
+                })
+                .collect::<Result<HashSet<_>>>()?;
+
+            // Add other explicitly linked images to root images
+            root_image_digests.extend(self.gc_category_roots(&images_fd, !orphans_only)?);
+
+            for ref image in self.gc_category_entry_ids(&images_fd, root_image_digests)? {
+                println!("# {image:?} lives as a root image");
+                objects.insert(image.0.clone());
+                self.objects_for_image(&image.1)?.iter().for_each(|id| {
+                    println!("#   with {id:?}");
+                    objects.insert(id.clone());
+                });
+            }
         }
 
-        let mut walked_streams = HashSet::new();
-        let stream_map = self.gc_category("streams", false)?;
-        for stream in self.gc_category("streams", true)? {
-            println!("# {stream:?} lives as a stream");
-            objects.insert(stream.0.clone());
-            self.walk_streams(&stream.1, &mut walked_streams, &mut objects, &stream_map)?;
+        // Find live objects from streams
+        if let Some(streams_fd) = self.open_gc_category("streams")? {
+            // Use explicitly specified root streams
+            let mut root_stream_digests = root_streams
+                .into_iter()
+                .map(|digest| {
+                    CString::new(digest).context("Converting input root_streams to CString")
+                })
+                .collect::<Result<HashSet<_>>>()?;
+
+            // Add other explicitly linked streams to root streams
+            root_stream_digests.extend(self.gc_category_roots(&streams_fd, !orphans_only)?);
+
+            let mut walked_streams = HashSet::new();
+            // reverse map of all defined streams from their underlying objects IDs, used for walking streams
+            let stream_map = self
+                .gc_category_entry_ids(&streams_fd, self.gc_category_roots(&streams_fd, false)?)?;
+            for stream in self.gc_category_entry_ids(&streams_fd, root_stream_digests)? {
+                println!("# {stream:?} lives as a root stream");
+                objects.insert(stream.0.clone());
+                self.walk_streams(&stream.1, &mut walked_streams, &mut objects, &stream_map)?;
+            }
         }
 
         for first_byte in 0x0..=0xff {
@@ -752,7 +802,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Err(Errno::NOENT) => continue,
                 Err(e) => Err(e)?,
             };
-            for item in Dir::new(dirfd)? {
+            for item in Dir::read_from(&dirfd)? {
                 let entry = item?;
                 let filename = entry.file_name();
                 if filename != c"." && filename != c".." {
@@ -760,11 +810,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())?;
                     if !objects.contains(&id) {
                         println!("rm objects/{first_byte:02x}/{filename:?}");
+                        if force {
+                            unlinkat(&dirfd, filename, AtFlags::empty())?;
+                        }
                     } else {
                         println!("# objects/{first_byte:02x}/{filename:?} lives");
                     }
                 }
             }
+        }
+
+        if !force {
+            println!("# No actual deletion is performed since --force is not set");
         }
 
         Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?

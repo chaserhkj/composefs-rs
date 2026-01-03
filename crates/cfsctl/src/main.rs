@@ -83,7 +83,7 @@ enum OciCommand {
         config_name: String,
         /// verity sha512 digest for the manifest stream to be verified against
         config_verity: Option<String>,
-        /// wether bootable preparation should be performed on the image before computation 
+        /// wether bootable preparation should be performed on the image before computation
         #[clap(long)]
         bootable: bool,
     },
@@ -117,7 +117,7 @@ enum OciCommand {
         mountpoint: String,
     },
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable preparation, commit it to the repo,
-    /// then configure boot for the image by writing new boot resources and bootloader entires to boot partition. Performs 
+    /// then configure boot for the image by writing new boot resources and bootloader entires to boot partition. Performs
     /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
     /// consumption by bootc.
     PrepareBoot {
@@ -148,11 +148,22 @@ enum Command {
         name: String,
     },
     /// Perform garbage collection
-    GC,
-    /// Imports a composefs image (unsafe!)
-    ImportImage {
-        reference: String,
+    GC {
+        // digest of root images for gc operations
+        #[clap(long, short = 'i')]
+        root_images: Vec<String>,
+        // digest of root streams for gc operations
+        #[clap(long, short = 's')]
+        root_streams: Vec<String>,
+        // collects orphan objects only
+        #[clap(long)]
+        orphans_only: bool,
+        // actually perform deletion instead of just printing removals
+        #[clap(short, long)]
+        force: bool,
     },
+    /// Imports a composefs image (unsafe!)
+    ImportImage { reference: String },
     /// Commands for dealing with OCI images and layers
     #[cfg(feature = "oci")]
     Oci {
@@ -210,10 +221,7 @@ enum Command {
         name: String,
     },
     #[cfg(feature = "http")]
-    Fetch {
-        url: String,
-        name: String,
-    },
+    Fetch { url: String, name: String },
 }
 
 fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
@@ -440,8 +448,13 @@ where
                 println!("{}", object.to_id());
             }
         }
-        Command::GC => {
-            repo.gc()?;
+        Command::GC {
+            root_images,
+            root_streams,
+            orphans_only,
+            force,
+        } => {
+            repo.gc(root_images, root_streams, orphans_only, force)?;
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
