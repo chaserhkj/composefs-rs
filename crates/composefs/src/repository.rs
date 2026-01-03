@@ -5,11 +5,12 @@
 //! verification and garbage collection support.
 
 use std::{
-    collections::HashSet,
-    ffi::CStr,
+    collections::{HashMap, HashSet},
+    ffi::{CStr, CString, OsStr},
     fs::{canonicalize, File},
     io::{Read, Write},
     os::fd::{AsFd, OwnedFd},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -572,7 +573,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(ObjectID::from_object_pathname(link_content.to_bytes())?)
     }
 
-    fn walk_symlinkdir(fd: OwnedFd, objects: &mut HashSet<ObjectID>) -> Result<()> {
+    fn walk_symlinkdir(fd: OwnedFd, entry_digests: &mut HashSet<CString>) -> Result<()> {
         for item in Dir::read_from(&fd)? {
             let entry = item?;
             // NB: the underlying filesystem must support returning filetype via direntry
@@ -582,11 +583,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     let filename = entry.file_name();
                     if filename != c"." && filename != c".." {
                         let dirfd = openat(&fd, filename, OFlags::RDONLY, Mode::empty())?;
-                        Self::walk_symlinkdir(dirfd, objects)?;
+                        Self::walk_symlinkdir(dirfd, entry_digests)?;
                     }
                 }
                 FileType::Symlink => {
-                    objects.insert(Self::read_symlink_hashvalue(&fd, entry.file_name())?);
+                    let link_content = readlinkat(&fd, entry.file_name(), [])?;
+                    let linked_path = Path::new(OsStr::from_bytes(link_content.as_bytes()));
+                    if let Some(entry_name) = linked_path.file_name() {
+                        entry_digests.insert(CString::new(entry_name.as_bytes())?);
+                    } else {
+                        // Does not have a proper file base name (i.e. "..")
+                        continue;
+                    }
                 }
                 _ => {
                     bail!("Unexpected file type encountered");
@@ -608,53 +616,96 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
     }
 
-    fn gc_category(&self, category: &str) -> Result<HashSet<ObjectID>> {
-        let mut objects = HashSet::new();
-
+    // For a GC category (images / streams), return underlying entry digests and
+    // object IDs for each entry, as a reverse lookup map
+    // If refs_only == false, all entries will be returned, and only orphans in
+    // objects/ will be GC'd
+    // If refs_only == true, only entries explicitly referred to in <category>/refs
+    // will be returned, allow unlinked entries to be GC'ed
+    fn gc_category(&self, category: &str, refs_only: bool) -> Result<HashMap<ObjectID, String>> {
         let Some(category_fd) = self
             .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
             .filter_errno(Errno::NOENT)
             .context("Opening {category} dir in repository")?
         else {
-            return Ok(objects);
+            return Ok(HashMap::new());
         };
 
-        if let Some(refs) = openat(
-            &category_fd,
-            "refs",
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            Mode::empty(),
-        )
-        .filter_errno(Errno::NOENT)
-        .context("Opening {category}/refs dir in repository")?
-        {
-            Self::walk_symlinkdir(refs, &mut objects)?;
-        }
-
-        for item in Dir::read_from(&category_fd)? {
-            let entry = item?;
-            let filename = entry.file_name();
-            if filename != c"refs" && filename != c"." && filename != c".." {
-                if entry.file_type() != FileType::Symlink {
-                    bail!("category directory contains non-symlink");
+        let mut entry_digests = HashSet::new();
+        if refs_only {
+            if let Some(refs) = openat(
+                &category_fd,
+                "refs",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .filter_errno(Errno::NOENT)
+            .context("Opening {category}/refs dir in repository")?
+            {
+                Self::walk_symlinkdir(refs, &mut entry_digests)?;
+            }
+        } else {
+            // All first-level link entries should be directly object references
+            for item in Dir::read_from(&category_fd)? {
+                let entry = item?;
+                let filename = entry.file_name();
+                if filename != c"refs" && filename != c"." && filename != c".." {
+                    if entry.file_type() != FileType::Symlink {
+                        bail!("category directory contains non-symlink");
+                    }
+                    entry_digests.insert(entry.file_name().to_owned());
                 }
-
-                // TODO: we need to sort this out.  the symlink itself might be a sha256 content ID
-                // (as for splitstreams), not an object/ to be preserved.
-                continue;
-
-                /*
-                let mut value = Sha256HashValue::EMPTY;
-                hex::decode_to_slice(filename.to_bytes(), &mut value)?;
-
-                if !objects.contains(&value) {
-                    println!("rm {}/{:?}", category, filename);
-                }
-                */
             }
         }
 
+        let objects = entry_digests
+            .into_iter()
+            .map(|entry_fn| {
+                Ok((
+                    Self::read_symlink_hashvalue(&category_fd, &entry_fn)?,
+                    entry_fn.to_str()?.to_owned(),
+                ))
+            })
+            .collect::<Result<_>>()?;
+
         Ok(objects)
+    }
+
+    // Traverse split streams to resolve all linked objects
+    fn walk_streams(
+        &self,
+        stream_digest: &str,
+        walked_streams: &mut HashSet<String>,
+        objects: &mut HashSet<ObjectID>,
+        stream_map: &HashMap<ObjectID, String>,
+    ) -> Result<()> {
+        // A split stream links to stored objects, but the the linked objects themselves could be streams that links
+        // to other objects as well. For example an OCI image manifest links to layer objects which are split streams
+        // linking to layer contents. This function walks the streams down and collects all linked objects
+        if walked_streams.contains(stream_digest) {
+            return Ok(());
+        }
+        walked_streams.insert(stream_digest.to_owned());
+
+        let mut split_stream = self.open_stream(stream_digest, None)?;
+        let mut streams_to_walk = HashSet::new();
+        split_stream.get_object_refs(|id| {
+            println!("#   with {id:?}");
+            objects.insert(id.clone());
+            if stream_map.contains_key(id) {
+                let digest = stream_map.get(id).expect("key exists");
+                println!("#   which is streams/{digest:}");
+                streams_to_walk.insert(digest);
+            }
+        })?;
+        streams_to_walk
+            .into_iter()
+            .map(|stream_digest| {
+                self.walk_streams(stream_digest, walked_streams, objects, stream_map)
+            })
+            .collect::<Result<()>>()?;
+
+        Ok(())
     }
 
     /// Given an image, return the set of all objects referenced by it.
@@ -675,21 +726,21 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         let mut objects = HashSet::new();
 
-        for ref object in self.gc_category("images")? {
-            println!("{object:?} lives as an image");
-            objects.insert(object.clone());
-            objects.extend(self.objects_for_image(&object.to_hex())?);
+        for ref image in self.gc_category("images", true)? {
+            println!("# {image:?} lives as an image");
+            objects.insert(image.0.clone());
+            self.objects_for_image(&image.1)?.iter().for_each(|id| {
+                println!("#   with {id:?}");
+                objects.insert(id.clone());
+            });
         }
 
-        for object in self.gc_category("streams")? {
-            println!("{object:?} lives as a stream");
-            objects.insert(object.clone());
-
-            let mut split_stream = self.open_stream(&object.to_hex(), None)?;
-            split_stream.get_object_refs(|id| {
-                println!("   with {id:?}");
-                objects.insert(id.clone());
-            })?;
+        let mut walked_streams = HashSet::new();
+        let stream_map = self.gc_category("streams", false)?;
+        for stream in self.gc_category("streams", true)? {
+            println!("# {stream:?} lives as a stream");
+            objects.insert(stream.0.clone());
+            self.walk_streams(&stream.1, &mut walked_streams, &mut objects, &stream_map)?;
         }
 
         for first_byte in 0x0..=0xff {
