@@ -19,8 +19,8 @@ use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, unlinkat, AtFlags, Dir,
-        FileType, FlockOperation, Mode, OFlags, CWD,
+        fdatasync, flock, linkat, mkdirat, open, openat, readlinkat, statat, unlinkat, AtFlags,
+        Dir, FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -605,6 +605,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    // Remove all broken links from a directory, may operator recursively
+    fn cleanup_broken_links(fd: &OwnedFd, recursive: bool) -> Result<()> {
+        for item in Dir::read_from(fd)? {
+            let entry = item?;
+            match entry.file_type() {
+                FileType::Directory => {
+                    if !recursive {
+                        continue;
+                    }
+                    let filename = entry.file_name();
+                    if filename != c"." && filename != c".." {
+                        let dirfd = openat(fd, filename, OFlags::RDONLY, Mode::empty())?;
+                        Self::cleanup_broken_links(&dirfd, recursive)?;
+                    }
+                }
+
+                FileType::Symlink => {
+                    let filename = entry.file_name();
+                    let result = statat(&fd, filename, AtFlags::empty())
+                        .filter_errno(Errno::NOENT)
+                        .context("Testing for broken links")?;
+                    if result.is_none() {
+                        unlinkat(&fd, filename, AtFlags::empty())
+                            .context("Unlinking broken links")?;
+                    }
+                }
+
+                _ => {
+                    bail!("Unexpected file type encountered");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Open the provided path in the repository.
     fn openat(&self, name: &str, flags: OFlags) -> ErrnoResult<OwnedFd> {
         // Unconditionally add CLOEXEC as we always want it.
@@ -722,6 +757,28 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    // Clean up broken links in a gc category
+    fn cleanup_gc_category(&self, category: &'static str) -> Result<()> {
+        if let Some(category_fd) = self.open_gc_category(category)? {
+            // Always cleanup first-level first, then the refs
+            Self::cleanup_broken_links(&category_fd, false)
+                .context("Cleaning up broken links in {category}/")?;
+            let ref_fd = openat(
+                &category_fd,
+                "refs",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .filter_errno(Errno::NOENT)
+            .context("Opening {category}/refs to clean up broken links")?;
+            if let Some(ref dirfd) = ref_fd {
+                Self::cleanup_broken_links(dirfd, true)
+                    .context("Cleaning up broken links recursively in {category}/refs")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Given an image, return the set of all objects referenced by it.
     pub fn objects_for_image(&self, name: &str) -> Result<HashSet<ObjectID>> {
         let (image, _) = self.open_image(name)?;
@@ -735,13 +792,16 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
-    pub fn gc(
+    pub fn gc<I>(
         &self,
-        root_images: Vec<String>,
-        root_streams: Vec<String>,
+        root_images: I,
+        root_streams: I,
         orphans_only: bool,
         force: bool,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = String>,
+    {
         flock(&self.repository, FlockOperation::LockExclusive)?;
 
         let mut objects = HashSet::new();
@@ -822,6 +882,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         if !force {
             println!("# No actual deletion is performed since --force is not set");
+        } else {
+            println!("# Cleaning up reference links...");
+            self.cleanup_gc_category("images")?;
+            self.cleanup_gc_category("streams")?
         }
 
         Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?
