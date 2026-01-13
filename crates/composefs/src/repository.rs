@@ -5,7 +5,7 @@
 //! verification and garbage collection support.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::{CStr, CString, OsStr},
     fs::{canonicalize, File},
     io::{Read, Write},
@@ -16,14 +16,15 @@ use std::{
     thread::available_parallelism,
 };
 
+use log::{debug, info};
 use tokio::sync::Semaphore;
 
 use anyhow::{bail, ensure, Context, Result};
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        flock, linkat, mkdirat, open, openat, readlinkat, statat, syncfs, AtFlags, Dir, FileType,
-        FlockOperation, Mode, OFlags, CWD,
+        flock, linkat, mkdirat, open, openat, readlinkat, statat, syncfs, unlinkat, AtFlags, Dir,
+        FileType, FlockOperation, Mode, OFlags, CWD,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -825,18 +826,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     // For a GC category (images / streams), return underlying entry digests and
-    // object IDs for each entry, as a reverse lookup map
+    // object IDs for each entry
     // If refs_only == false, all entries will be returned, and only orphans in
     // objects/ will be GC'd
     // If refs_only == true, only entries explicitly referred to in <category>/refs
     // will be returned, allow unlinked entries to be GC'ed
-    fn gc_category(&self, category: &str, refs_only: bool) -> Result<HashMap<ObjectID, String>> {
+    fn gc_category(&self, category: &str, refs_only: bool) -> Result<Vec<(ObjectID, String)>> {
         let Some(category_fd) = self
             .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
             .filter_errno(Errno::NOENT)
             .context(format!("Opening {category} dir in repository"))?
         else {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         };
 
         let mut entry_digests = HashSet::new();
@@ -879,35 +880,91 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(objects)
     }
 
+    // Remove all broken links from a directory, may operate recursively
+    fn cleanup_broken_links(fd: &OwnedFd, recursive: bool) -> Result<()> {
+        for item in Dir::read_from(fd)? {
+            let entry = item?;
+            match entry.file_type() {
+                FileType::Directory => {
+                    if !recursive {
+                        continue;
+                    }
+                    let filename = entry.file_name();
+                    if filename != c"." && filename != c".." {
+                        let dirfd = openat(fd, filename, OFlags::RDONLY, Mode::empty())?;
+                        Self::cleanup_broken_links(&dirfd, recursive)?;
+                    }
+                }
+
+                FileType::Symlink => {
+                    let filename = entry.file_name();
+                    let result = statat(&fd, filename, AtFlags::empty())
+                        .filter_errno(Errno::NOENT)
+                        .context("Testing for broken links")?;
+                    if result.is_none() {
+                        unlinkat(&fd, filename, AtFlags::empty())
+                            .context("Unlinking broken links")?;
+                    }
+                }
+
+                _ => {
+                    bail!("Unexpected file type encountered");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Clean up broken links in a gc category
+    fn cleanup_gc_category(&self, category: &'static str) -> Result<()> {
+        if let Some(category_fd) = self
+            .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
+            .filter_errno(Errno::NOENT)
+            .context(format!("Opening {category} dir in repository"))? {
+            // Always cleanup first-level first, then the refs
+            Self::cleanup_broken_links(&category_fd, false)
+                .context(format!("Cleaning up broken links in {category}/"))?;
+            let ref_fd = openat(
+                &category_fd,
+                "refs",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .filter_errno(Errno::NOENT)
+            .context(format!("Opening {category}/refs to clean up broken links"))?;
+            if let Some(ref dirfd) = ref_fd {
+                Self::cleanup_broken_links(dirfd, true)
+                    .context(format!("Cleaning up broken links recursively in {category}/refs"))?;
+            }
+        }
+        Ok(())
+    }
+
     // Traverse split streams to resolve all linked objects
     fn walk_streams(
         &self,
-        stream_digest: &str,
+        stream_name: &str,
         walked_streams: &mut HashSet<String>,
         objects: &mut HashSet<ObjectID>,
-        stream_map: &HashMap<ObjectID, String>,
     ) -> Result<()> {
-        // A split stream links to stored objects, but the linked objects themselves could be streams that links
-        // to other objects as well. For example an OCI image manifest links to layer objects which are split streams
-        // linking to layer contents. This function walks the streams down and collects all linked objects
-        if walked_streams.contains(stream_digest) {
+        if walked_streams.contains(stream_name) {
             return Ok(());
         }
-        walked_streams.insert(stream_digest.to_owned());
+        walked_streams.insert(stream_name.to_owned());
 
-        let mut split_stream = self.open_stream(stream_digest, None, None)?;
-        let mut streams_to_walk = HashSet::new();
+        let mut split_stream = self.open_stream(stream_name, None, None)?;
+        // Plain object references, add to live objects set
         split_stream.get_object_refs(|id| {
-            println!("#   with {id:?}");
+            debug!("   with {id:?}");
             objects.insert(id.clone());
-            if stream_map.contains_key(id) {
-                let digest = stream_map.get(id).expect("key exists");
-                println!("#   which is streams/{digest:}");
-                streams_to_walk.insert(digest);
-            }
         })?;
+        // Collect all stream names from named references table to be walked next
+        let streams_to_walk: Vec<_> = split_stream
+            .iter_named_refs()
+            .map(|(name, _id)| name)
+            .collect();
         for stream_digest in streams_to_walk {
-            self.walk_streams(stream_digest, walked_streams, objects, stream_map)?;
+            self.walk_streams(stream_digest, walked_streams, objects)?;
         }
         Ok(())
     }
@@ -943,26 +1000,56 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// # Locking
     ///
     /// An exclusive lock is held for the duration of this operation.
-    pub fn gc(&self) -> Result<()> {
+    pub fn gc(
+        &self,
+        root_image_names: Vec<String>,
+        root_stream_names: Vec<String>,
+        force: bool,
+    ) -> Result<()> {
         flock(&self.repository, FlockOperation::LockExclusive)?;
 
         let mut objects = HashSet::new();
 
-        for ref image in self.gc_category("images", true)? {
-            println!("# {image:?} lives as an image");
+        // All GC root image names, as specified by user
+        let root_image_name_set: HashSet<_> = root_image_names.into_iter().collect();
+        // All images stored in repo
+        let all_images = self.gc_category("images", false)?;
+        // All GC root images, including those referenced in images/refs
+        let root_images: Vec<_> = all_images
+            .into_iter()
+            // filter only keeps user specified images
+            .filter(|(_id, name)| root_image_name_set.contains(name))
+            // then add images referenced in images/refs
+            .chain(self.gc_category("images", true)?)
+            .collect();
+
+        for ref image in root_images {
+            debug!("{image:?} lives as an image");
             objects.insert(image.0.clone());
             self.objects_for_image(&image.1)?.iter().for_each(|id| {
-                println!("#   with {id:?}");
+                debug!("   with {id:?}");
                 objects.insert(id.clone());
             });
         }
 
+        // All GC root stream names, as specified by user
+        let root_stream_name_set: HashSet<_> = root_stream_names.into_iter().collect();
+        // All streams stored in repo
+        let all_streams = self.gc_category("streams", false)?;
+        // All GC root streams, including those referenced in streams/refs
+        let root_streams: Vec<_> = all_streams
+            .into_iter()
+            // filter only keeps user specified streams
+            .filter(|(_id, name)| root_stream_name_set.contains(name))
+            // then add streams referenced in streams/refs
+            .chain(self.gc_category("streams", true)?)
+            .collect();
+
         let mut walked_streams = HashSet::new();
-        let stream_map = self.gc_category("streams", false)?;
-        for stream in self.gc_category("streams", true)? {
-            println!("# {stream:?} lives as a stream");
+        for stream in root_streams {
+            debug!("{stream:?} lives as a stream");
             objects.insert(stream.0.clone());
-            self.walk_streams(&stream.1, &mut walked_streams, &mut objects, &stream_map)?;
+            self.walk_streams(&stream.1, &mut walked_streams, &mut objects)?;
         }
 
         for first_byte in 0x0..=0xff {
@@ -974,19 +1061,32 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Err(Errno::NOENT) => continue,
                 Err(e) => Err(e)?,
             };
-            for item in Dir::new(dirfd)? {
+            for item in Dir::read_from(&dirfd)? {
                 let entry = item?;
                 let filename = entry.file_name();
                 if filename != c"." && filename != c".." {
                     let id =
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())?;
                     if !objects.contains(&id) {
-                        println!("rm objects/{first_byte:02x}/{filename:?}");
+                        if force {
+                            info!("rm objects/{first_byte:02x}/{filename:?}");
+                            unlinkat(&dirfd, filename, AtFlags::empty())?;
+                        } else {
+                            info!("dry run: rm objects/{first_byte:02x}/{filename:?}");
+                        }
                     } else {
-                        println!("# objects/{first_byte:02x}/{filename:?} lives");
+                        debug!("objects/{first_byte:02x}/{filename:?} lives");
                     }
                 }
             }
+        }
+        // Clean up all broken links
+        if !force {
+            info!("No actual deletion is performed since --force is not set");
+        } else {
+            info!("Cleaning up broken links");
+            self.cleanup_gc_category("images")?;
+            self.cleanup_gc_category("streams")?
         }
 
         Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?

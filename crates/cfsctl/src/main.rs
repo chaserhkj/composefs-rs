@@ -120,7 +120,17 @@ enum Command {
         name: String,
     },
     /// Perform garbage collection
-    GC,
+    GC {
+        // digest of root images for gc operations
+        #[clap(long, short = 'i')]
+        root_images: Vec<String>,
+        // digest of root streams for gc operations
+        #[clap(long, short = 's')]
+        root_streams: Vec<String>,
+        // actually perform deletion instead of just printing removals
+        #[clap(short, long)]
+        force: bool,
+    },
     /// Imports a composefs image (unsafe!)
     ImportImage {
         reference: String,
@@ -393,8 +403,12 @@ where
                 println!("{}", object.to_id());
             }
         }
-        Command::GC => {
-            repo.gc()?;
+        Command::GC {
+            root_images,
+            root_streams,
+            force,
+        } => {
+            repo.gc(root_images, root_streams, force)?;
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
