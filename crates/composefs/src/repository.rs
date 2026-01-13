@@ -5,7 +5,7 @@
 //! verification and garbage collection support.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
     fs::{canonicalize, File},
     io::{Read, Write},
@@ -16,7 +16,7 @@ use std::{
     thread::available_parallelism,
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::sync::Semaphore;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -945,6 +945,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // Traverse split streams to resolve all linked objects
     fn walk_streams(
         &self,
+        stream_name_map: &HashMap<ObjectID, String>,
         stream_name: &str,
         walked_streams: &mut HashSet<String>,
         objects: &mut HashSet<ObjectID>,
@@ -962,10 +963,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         })?;
         // Collect all stream names from named references table to be walked next
         let streams_to_walk: Vec<_> = split_stream.iter_named_refs().collect();
-        for (stream_name, stream_object_id) in streams_to_walk {
-            debug!("   named reference stream {stream_name} lives, with {stream_object_id:?}");
+        // Note that stream name from the named references table is not stream name in repository
+        // In practice repository name is often table name prefixed with stream types (e.g. oci-config-<table name>)
+        // Here we always match objectID to be absolutely sure
+        for (stream_name_in_table, stream_object_id) in streams_to_walk {
+            debug!(
+                "   named reference stream {stream_name_in_table} lives, with {stream_object_id:?}"
+            );
             objects.insert(stream_object_id.clone());
-            self.walk_streams(stream_name, walked_streams, objects)?;
+            if let Some(stream_name_in_repo) = stream_name_map.get(stream_object_id) {
+                self.walk_streams(
+                    stream_name_map,
+                    stream_name_in_repo,
+                    walked_streams,
+                    objects,
+                )?;
+            } else {
+                // stream is in table but not in repo, the repo is potentially broken, issue a warning
+                warn!("broken repo: named reference stream {stream_name_in_table} not found as stream in repo");
+            }
         }
         Ok(())
     }
@@ -1037,6 +1053,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let root_stream_name_set: HashSet<_> = root_stream_names.into_iter().collect();
         // All streams stored in repo
         let all_streams = self.gc_category("streams", false)?;
+        // Reverse map of stream object IDs to their names, used for resolving stream names in repo
+        let stream_name_map: HashMap<_, _> = all_streams.clone().into_iter().collect();
         // All GC root streams, including those referenced in streams/refs
         let root_streams: Vec<_> = all_streams
             .into_iter()
@@ -1050,7 +1068,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         for stream in root_streams {
             debug!("{stream:?} lives as a stream");
             objects.insert(stream.0.clone());
-            self.walk_streams(&stream.1, &mut walked_streams, &mut objects)?;
+            self.walk_streams(
+                &stream_name_map,
+                &stream.1,
+                &mut walked_streams,
+                &mut objects,
+            )?;
         }
 
         for first_byte in 0x0..=0xff {
@@ -1355,6 +1378,66 @@ mod tests {
 
         let mut writer2 = repo.create_stream(0);
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
+        let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec!["test-stream2".to_string()], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_named_references_with_different_table_name() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer1 = repo.create_stream(0);
+        writer1.write_external(&obj2)?;
+        let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
+
+        let mut writer2 = repo.create_stream(0);
+        writer2.add_named_stream_ref("different-table-name-for-test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
         repo.sync()?;
