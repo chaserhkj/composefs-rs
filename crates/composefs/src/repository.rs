@@ -898,11 +898,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
                 FileType::Symlink => {
                     let filename = entry.file_name();
-                    let result = statat(&fd, filename, AtFlags::empty())
+                    let result = statat(fd, filename, AtFlags::empty())
                         .filter_errno(Errno::NOENT)
                         .context("Testing for broken links")?;
                     if result.is_none() {
-                        unlinkat(&fd, filename, AtFlags::empty())
+                        unlinkat(fd, filename, AtFlags::empty())
                             .context("Unlinking broken links")?;
                     }
                 }
@@ -920,7 +920,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         if let Some(category_fd) = self
             .openat(category, OFlags::RDONLY | OFlags::DIRECTORY)
             .filter_errno(Errno::NOENT)
-            .context(format!("Opening {category} dir in repository"))? {
+            .context(format!("Opening {category} dir in repository"))?
+        {
             // Always cleanup first-level first, then the refs
             Self::cleanup_broken_links(&category_fd, false)
                 .context(format!("Cleaning up broken links in {category}/"))?;
@@ -933,8 +934,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .filter_errno(Errno::NOENT)
             .context(format!("Opening {category}/refs to clean up broken links"))?;
             if let Some(ref dirfd) = ref_fd {
-                Self::cleanup_broken_links(dirfd, true)
-                    .context(format!("Cleaning up broken links recursively in {category}/refs"))?;
+                Self::cleanup_broken_links(dirfd, true).context(format!(
+                    "Cleaning up broken links recursively in {category}/refs"
+                ))?;
             }
         }
         Ok(())
@@ -959,12 +961,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             objects.insert(id.clone());
         })?;
         // Collect all stream names from named references table to be walked next
-        let streams_to_walk: Vec<_> = split_stream
-            .iter_named_refs()
-            .map(|(name, _id)| name)
-            .collect();
-        for stream_digest in streams_to_walk {
-            self.walk_streams(stream_digest, walked_streams, objects)?;
+        let streams_to_walk: Vec<_> = split_stream.iter_named_refs().collect();
+        for (stream_name, stream_object_id) in streams_to_walk {
+            debug!("   named reference stream {stream_name} lives, with {stream_object_id:?}");
+            objects.insert(stream_object_id.clone());
+            self.walk_streams(stream_name, walked_streams, objects)?;
         }
         Ok(())
     }
@@ -1095,4 +1096,646 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     // fn fsck(&self) -> Result<()> {
     //     unimplemented!()
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec;
+
+    use super::*;
+    use crate::fsverity::Sha512HashValue;
+    use crate::test::tempdir;
+    use rustix::fs::{statat, CWD};
+    use tempfile::TempDir;
+
+    /// Create a test repository in insecure mode (no fs-verity required).
+    fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
+        mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
+        let mut repo = Repository::open_path(CWD, path)?;
+        repo.set_insecure(true);
+        Ok(Arc::new(repo))
+    }
+
+    /// Generate deterministic test data of a given size.
+    fn generate_test_data(size: u64, seed: u8) -> Vec<u8> {
+        (0..size)
+            .map(|i| ((i as u8).wrapping_add(seed)).wrapping_mul(17))
+            .collect()
+    }
+
+    fn read_links_in_repo<P>(tmp: &TempDir, repo_sub_path: P) -> Result<Option<PathBuf>>
+    where
+        P: AsRef<Path>,
+    {
+        let full_path = tmp.path().join("repo").join(repo_sub_path);
+        match readlinkat(CWD, &full_path, Vec::new()) {
+            Ok(result) => Ok(Some(PathBuf::from(result.to_str()?))),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // Does not follow symlinks
+    fn test_path_exists_in_repo<P>(tmp: &TempDir, repo_sub_path: P) -> Result<bool>
+    where
+        P: AsRef<Path>,
+    {
+        let full_path = tmp.path().join("repo").join(repo_sub_path);
+        match statat(CWD, &full_path, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn test_object_exists(tmp: &TempDir, obj: &Sha512HashValue) -> Result<bool> {
+        let digest = obj.to_hex();
+        let (first_two, remainder) = digest.split_at(2);
+        test_path_exists_in_repo(tmp, &format!("objects/{first_two}/{remainder}"))
+    }
+
+    #[test]
+    fn test_gc_removes_one_stream() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj2)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(!test_object_exists(&tmp, &obj2_id)?);
+        assert!(!test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_stream() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj2)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec!["test-stream".to_string()], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_stream_from_refs() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj2)?;
+        let _stream_id = repo.write_stream(writer, "test-stream", Some("ref-name"))?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_stream_from_two_overlapped() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+        let obj3 = generate_test_data(64 * 1024, 0xAA);
+        let obj4 = generate_test_data(64 * 1024, 0xEE);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+        let obj3_id: Sha512HashValue = compute_verity(&obj3);
+        let obj4_id: Sha512HashValue = compute_verity(&obj4);
+
+        let mut writer1 = repo.create_stream(0);
+        writer1.write_external(&obj2)?;
+        writer1.write_external(&obj3)?;
+        let _stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
+
+        let mut writer2 = repo.create_stream(0);
+        writer2.write_external(&obj2)?;
+        writer2.write_external(&obj4)?;
+        let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec!["test-stream1".to_string()], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(!test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(!test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_named_references() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+
+        let mut writer1 = repo.create_stream(0);
+        writer1.write_external(&obj2)?;
+        let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
+
+        let mut writer2 = repo.create_stream(0);
+        writer2.add_named_stream_ref("test-stream1", &stream1_id);
+        let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec!["test-stream2".to_string()], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_named_reference_from_two_overlapped() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2 = generate_test_data(64 * 1024, 0xEA);
+        let obj3 = generate_test_data(64 * 1024, 0xAA);
+        let obj4 = generate_test_data(64 * 1024, 0xEE);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id: Sha512HashValue = compute_verity(&obj2);
+        let obj3_id: Sha512HashValue = compute_verity(&obj3);
+        let obj4_id: Sha512HashValue = compute_verity(&obj4);
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj2)?;
+        let stream1_id = repo.write_stream(writer, "test-stream1", None)?;
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj3)?;
+        let stream2_id = repo.write_stream(writer, "test-stream2", None)?;
+
+        let mut writer = repo.create_stream(0);
+        writer.write_external(&obj4)?;
+        let stream3_id = repo.write_stream(writer, "test-stream3", None)?;
+
+        let mut writer = repo.create_stream(0);
+        writer.add_named_stream_ref("test-stream1", &stream1_id);
+        writer.add_named_stream_ref("test-stream2", &stream2_id);
+        let _ref_stream1_id = repo.write_stream(writer, "ref-stream1", None)?;
+
+        let mut writer = repo.create_stream(0);
+        writer.add_named_stream_ref("test-stream1", &stream1_id);
+        writer.add_named_stream_ref("test-stream3", &stream3_id);
+        let _ref_stream2_id = repo.write_stream(writer, "ref-stream2", None)?;
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream3")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream3")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/ref-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/ref-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/ref-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/ref-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec!["ref-stream1".to_string()], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(!test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/test-stream2")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/test-stream2")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(!test_path_exists_in_repo(&tmp, "streams/test-stream3")?);
+        assert!(test_path_exists_in_repo(&tmp, "streams/ref-stream1")?);
+        let link_target =
+            read_links_in_repo(&tmp, "streams/ref-stream1")?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("streams").join(&link_target)
+        )?);
+        assert!(!test_path_exists_in_repo(&tmp, "streams/ref-stream2")?);
+
+        Ok(())
+    }
+
+    use crate::tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat};
+
+    // Make a test in-memory filesystem that only contains one externally referenced object
+    fn make_test_fs(obj: &Sha512HashValue, size: u64) -> FileSystem<Sha512HashValue> {
+        let mut root_dir: Directory<Sha512HashValue> = Directory::default();
+        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
+            stat: Stat {
+                st_mode: 0o644,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                xattrs: Default::default(),
+            },
+            content: LeafContent::Regular(RegularFile::External(obj.clone(), size)),
+        }));
+        root_dir.insert(OsStr::new("data"), inode);
+
+        FileSystem {
+            root: root_dir,
+            have_root_stat: false,
+        }
+    }
+
+    #[test]
+    fn test_gc_removes_one_image() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1_size: u64 = 32 * 1024;
+        let obj1 = generate_test_data(obj1_size, 0xAE);
+        let obj2_size: u64 = 64 * 1024;
+        let obj2 = generate_test_data(obj2_size, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id = repo.ensure_object(&obj2)?;
+
+        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let image1 = fs.commit_image(&repo, None)?;
+        let image1_path = format!("images/{}", image1.to_hex());
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(!test_object_exists(&tmp, &obj2_id)?);
+        assert!(!test_path_exists_in_repo(&tmp, &image1_path)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_image() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1_size: u64 = 32 * 1024;
+        let obj1 = generate_test_data(obj1_size, 0xAE);
+        let obj2_size: u64 = 64 * 1024;
+        let obj2 = generate_test_data(obj2_size, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id = repo.ensure_object(&obj2)?;
+
+        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let image1 = fs.commit_image(&repo, None)?;
+        let image1_path = format!("images/{}", image1.to_hex());
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![image1.to_hex()], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_one_image_from_refs() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1_size: u64 = 32 * 1024;
+        let obj1 = generate_test_data(obj1_size, 0xAE);
+        let obj2_size: u64 = 64 * 1024;
+        let obj2 = generate_test_data(obj2_size, 0xEA);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id = repo.ensure_object(&obj2)?;
+
+        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let image1 = fs.commit_image(&repo, Some("ref-name"))?;
+        let image1_path = format!("images/{}", image1.to_hex());
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+        Ok(())
+    }
+
+    fn make_test_fs_with_two_files(
+        obj1: &Sha512HashValue,
+        size1: u64,
+        obj2: &Sha512HashValue,
+        size2: u64,
+    ) -> FileSystem<Sha512HashValue> {
+        let mut fs = make_test_fs(obj1, size1);
+        let inode = Inode::Leaf(std::rc::Rc::new(Leaf {
+            stat: Stat {
+                st_mode: 0o644,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                xattrs: Default::default(),
+            },
+            content: LeafContent::Regular(RegularFile::External(obj2.clone(), size2)),
+        }));
+        fs.root.insert(OsStr::new("extra_data"), inode);
+        fs
+    }
+
+    #[test]
+    fn test_gc_keeps_one_image_from_two_overlapped() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1_size: u64 = 32 * 1024;
+        let obj1 = generate_test_data(obj1_size, 0xAE);
+        let obj2_size: u64 = 64 * 1024;
+        let obj2 = generate_test_data(obj2_size, 0xEA);
+        let obj3_size: u64 = 64 * 1024;
+        let obj3 = generate_test_data(obj2_size, 0xAA);
+        let obj4_size: u64 = 64 * 1024;
+        let obj4 = generate_test_data(obj2_size, 0xEE);
+
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id = repo.ensure_object(&obj2)?;
+        let obj3_id = repo.ensure_object(&obj3)?;
+        let obj4_id = repo.ensure_object(&obj4)?;
+
+        let mut fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj3_id, obj3_size);
+        let image1 = fs.commit_image(&repo, None)?;
+        let image1_path = format!("images/{}", image1.to_hex());
+
+        let mut fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj4_id, obj4_size);
+        let image2 = fs.commit_image(&repo, None)?;
+        let image2_path = format!("images/{}", image2.to_hex());
+
+        repo.sync()?;
+
+        assert!(test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+        assert!(test_path_exists_in_repo(&tmp, &image2_path)?);
+        let link_target = read_links_in_repo(&tmp, &image2_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+
+        // Now perform gc
+        repo.gc(vec![image1.to_hex()], vec![], true)?;
+
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(test_object_exists(&tmp, &obj3_id)?);
+        assert!(!test_object_exists(&tmp, &obj4_id)?);
+        assert!(test_path_exists_in_repo(&tmp, &image1_path)?);
+        let link_target = read_links_in_repo(&tmp, &image1_path)?.expect("link is not broken");
+        assert!(test_path_exists_in_repo(
+            &tmp,
+            PathBuf::from("images").join(&link_target)
+        )?);
+        assert!(!test_path_exists_in_repo(&tmp, &image2_path)?);
+        Ok(())
+    }
 }
